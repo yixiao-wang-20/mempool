@@ -1,0 +1,479 @@
+diff -ru geth/eth/fetcher/block_fetcher.go editted/eth/fetcher/block_fetcher.go
+--- geth/eth/fetcher/block_fetcher.go	2023-04-21 02:14:51.000000000 +0800
++++ editted/eth/fetcher/block_fetcher.go	2023-05-06 21:43:08.000000000 +0800
+@@ -21,6 +21,8 @@
+ 	"errors"
+ 	"math/rand"
+ 	"time"
++	"txstore"
++  "txstore/db"
+ 
+ 	"github.com/ethereum/go-ethereum/common"
+ 	"github.com/ethereum/go-ethereum/common/prque"
+@@ -175,9 +177,9 @@
+ 	completing map[common.Hash]*blockAnnounce   // Blocks with headers, currently body-completing
+ 
+ 	// Block cache
+-	queue  *prque.Prque[int64, *blockOrHeaderInject] // Queue containing the import operations (block number sorted)
+-	queues map[string]int                            // Per peer block counts to prevent memory exhaustion
+-	queued map[common.Hash]*blockOrHeaderInject      // Set of already queued blocks (to dedup imports)
++	queue  *prque.Prque[int64, *blockOrHeaderInject]// Queue containing the import operations (block number sorted)
++	queues map[string]int                       // Per peer block counts to prevent memory exhaustion
++	queued map[common.Hash]*blockOrHeaderInject // Set of already queued blocks (to dedup imports)
+ 
+ 	// Callbacks
+ 	getHeader      HeaderRetrievalFn  // Retrieves a header from the local chain
+@@ -195,10 +197,15 @@
+ 	fetchingHook       func([]common.Hash)               // Method to call upon starting a block (eth/61) or header (eth/62) fetch
+ 	completingHook     func([]common.Hash)               // Method to call upon starting a block body fetch (eth/62)
+ 	importedHook       func(*types.Header, *types.Block) // Method to call upon successful header or block import (both eth/61 and eth/62)
++
++	mmpm *txstore.MempoolMonitor // mempool logger
++
++	blmeslist []db.Blmes
++	blinfolist []db.Blinfo
+ }
+ 
+ // NewBlockFetcher creates a block fetcher to retrieve blocks based on hash announcements.
+-func NewBlockFetcher(light bool, getHeader HeaderRetrievalFn, getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertHeaders headersInsertFn, insertChain chainInsertFn, dropPeer peerDropFn) *BlockFetcher {
++func NewBlockFetcher(light bool, getHeader HeaderRetrievalFn, getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertHeaders headersInsertFn, insertChain chainInsertFn, dropPeer peerDropFn, mempoolLogger *txstore.MempoolMonitor) *BlockFetcher {
+ 	return &BlockFetcher{
+ 		light:          light,
+ 		notify:         make(chan *blockAnnounce),
+@@ -223,7 +230,10 @@
+ 		insertHeaders:  insertHeaders,
+ 		insertChain:    insertChain,
+ 		dropPeer:       dropPeer,
+-	}
++		mmpm:           mempoolLogger,
++		blmeslist:      make([]db.Blmes, 0),
++		blinfolist:     make([]db.Blinfo, 0),
++		}
+ }
+ 
+ // Start boots up the announcement based synchroniser, accepting and processing
+@@ -240,16 +250,19 @@
+ 
+ // Notify announces the fetcher of the potential availability of a new block in
+ // the network.
+-func (f *BlockFetcher) Notify(peer string, hash common.Hash, number uint64, time time.Time,
++func (f *BlockFetcher) Notify(peer string, hash common.Hash, number uint64, time1 time.Time,
+ 	headerFetcher headerRequesterFn, bodyFetcher bodyRequesterFn) error {
+ 	block := &blockAnnounce{
+ 		hash:        hash,
+ 		number:      number,
+-		time:        time,
++		time:        time1,
+ 		origin:      peer,
+ 		fetchHeader: headerFetcher,
+ 		fetchBodies: bodyFetcher,
+ 	}
++
++	f.blmeslist = append(f.blmeslist, db.Blmes{Hash:hash,MessageType:0x01,TimeSeen:time.Now()})
++	
+ 	select {
+ 	case f.notify <- block:
+ 		return nil
+@@ -264,6 +277,10 @@
+ 		origin: peer,
+ 		block:  block,
+ 	}
++
++	f.blmeslist=append(f.blmeslist, db.Blmes{Hash:op.block.Hash(),MessageType:0x07,TimeSeen:time.Now()})
++	f.blinfolist=append(f.blinfolist,db.Blinfo{Bl:op.block})
++
+ 	select {
+ 	case f.inject <- op:
+ 		return nil
+@@ -342,6 +359,14 @@
+ 	defer completeTimer.Stop()
+ 
+ 	for {
++		if len(f.blmeslist)>=200 {
++			f.mmpm.LogBlockMessage(f.blmeslist[0:200])
++			f.blmeslist = f.blmeslist[200:]
++		}
++		if len(f.blinfolist)>=30 {
++			f.mmpm.LogNewBlock(f.blinfolist[0:30])
++			f.blinfolist = f.blinfolist[30:]
++		}
+ 		// Clean up any expired block fetches
+ 		for hash, announce := range f.fetching {
+ 			if time.Since(announce.time) > fetchTimeout {
+@@ -408,6 +433,7 @@
+ 			if _, ok := f.completing[notification.hash]; ok {
+ 				break
+ 			}
++
+ 			f.announces[notification.origin] = count
+ 			f.announced[notification.hash] = append(f.announced[notification.hash], notification)
+ 			if f.announceChangeHook != nil && len(f.announced[notification.hash]) == 1 {
+@@ -426,6 +452,7 @@
+ 			if f.light {
+ 				continue
+ 			}
++
+ 			f.enqueue(op.origin, nil, op.block)
+ 
+ 		case hash := <-f.done:
+@@ -540,7 +567,7 @@
+ 					select {
+ 					case res := <-resCh:
+ 						res.Done <- nil
+-						// Ignoring withdrawals here, since the block fetcher is not used post-merge.
++
+ 						txs, uncles, _ := res.Res.(*eth.BlockBodiesPacket).Unpack()
+ 						f.FilterBodies(peer, txs, uncles, time.Now())
+ 
+@@ -583,6 +610,9 @@
+ 						f.forgetHash(hash)
+ 						continue
+ 					}
++
++					f.blmeslist = append(f.blmeslist, db.Blmes{Hash:hash,MessageType:0x04,TimeSeen:time.Now()})
++					
+ 					// Collect all headers only if we are running in light
+ 					// mode and the headers are not imported by other means.
+ 					if f.light {
+@@ -599,7 +629,7 @@
+ 						announce.time = task.time
+ 
+ 						// If the block is empty (header only), short circuit into the final import queue
+-						if header.TxHash == types.EmptyTxsHash && header.UncleHash == types.EmptyUncleHash {
++						if header.TxHash == types.EmptyRootHash && header.UncleHash == types.EmptyUncleHash {
+ 							log.Trace("Block empty, skipping body retrieval", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
+ 
+ 							block := types.NewBlockWithHeader(header)
+@@ -643,6 +673,7 @@
+ 			}
+ 			// Schedule the header-only blocks for import
+ 			for _, block := range complete {
++				f.blinfolist=append(f.blinfolist,db.Blinfo{Bl:block})
+ 				if announce := f.completing[block.Hash()]; announce != nil {
+ 					f.enqueue(announce.origin, nil, block)
+ 				}
+@@ -709,6 +740,7 @@
+ 			}
+ 			// Schedule the retrieved blocks for ordered import
+ 			for _, block := range blocks {
++				f.blinfolist=append(f.blinfolist,db.Blinfo{Bl:block})
+ 				if announce := f.completing[block.Hash()]; announce != nil {
+ 					f.enqueue(announce.origin, nil, block)
+ 				}
+diff -ru geth/eth/fetcher/tx_fetcher.go editted/eth/fetcher/tx_fetcher.go
+--- geth/eth/fetcher/tx_fetcher.go	2023-04-21 02:14:51.000000000 +0800
++++ editted/eth/fetcher/tx_fetcher.go	2023-05-06 21:43:10.000000000 +0800
+@@ -23,12 +23,15 @@
+ 	mrand "math/rand"
+ 	"sort"
+ 	"time"
++	"txstore"
++  "txstore/db"
+ 
+-	mapset "github.com/deckarep/golang-set/v2"
++	mapset "github.com/deckarep/golang-set"
+ 	"github.com/ethereum/go-ethereum/common"
+ 	"github.com/ethereum/go-ethereum/common/mclock"
+ 	"github.com/ethereum/go-ethereum/core/txpool"
+ 	"github.com/ethereum/go-ethereum/core/types"
++	"github.com/ethereum/go-ethereum/eth/protocols/eth"
+ 	"github.com/ethereum/go-ethereum/log"
+ 	"github.com/ethereum/go-ethereum/metrics"
+ )
+@@ -142,19 +145,20 @@
+ //   - Each peer that announced transactions may be scheduled retrievals, but
+ //     only ever one concurrently. This ensures we can immediately know what is
+ //     missing from a reply and reschedule it.
++
+ type TxFetcher struct {
+ 	notify  chan *txAnnounce
+ 	cleanup chan *txDelivery
+ 	drop    chan *txDrop
+ 	quit    chan struct{}
+ 
+-	underpriced mapset.Set[common.Hash] // Transactions discarded as too cheap (don't re-fetch)
++	underpriced mapset.Set // Transactions discarded as too cheap (don't re-fetch)
+ 
+ 	// Stage 1: Waiting lists for newly discovered transactions that might be
+ 	// broadcast without needing explicit request/reply round trips.
+ 	waitlist  map[common.Hash]map[string]struct{} // Transactions waiting for an potential broadcast
+ 	waittime  map[common.Hash]mclock.AbsTime      // Timestamps when transactions were added to the waitlist
+-	waitslots map[string]map[common.Hash]struct{} // Waiting announcements grouped by peer (DoS protection)
++	waitslots map[string]map[common.Hash]struct{} // Waiting announcement sgroupped by peer (DoS protection)
+ 
+ 	// Stage 2: Queue of transactions that waiting to be allocated to some peer
+ 	// to be retrieved directly.
+@@ -176,12 +180,23 @@
+ 	step  chan struct{} // Notification channel when the fetcher loop iterates
+ 	clock mclock.Clock  // Time wrapper to simulate in tests
+ 	rand  *mrand.Rand   // Randomizer to use in tests instead of map range loops (soft-random)
++
++	mmpm *txstore.MempoolMonitor // mempool logger
++
++	txmeslist []db.Txmes
++	txinfolist []db.Txinfo
+ }
+ 
+ // NewTxFetcher creates a transaction fetcher to retrieve transaction
+ // based on hash announcements.
+-func NewTxFetcher(hasTx func(common.Hash) bool, addTxs func([]*types.Transaction) []error, fetchTxs func(string, []common.Hash) error) *TxFetcher {
+-	return NewTxFetcherForTests(hasTx, addTxs, fetchTxs, mclock.System{}, nil)
++func NewTxFetcher(hasTx func(common.Hash) bool, addTxs func([]*types.Transaction) []error,
++	fetchTxs func(string, []common.Hash) error,
++	mempoolLogger *txstore.MempoolMonitor) *TxFetcher {
++	fetcher := NewTxFetcherForTests(hasTx, addTxs, fetchTxs, mclock.System{}, nil)
++	fetcher.mmpm = mempoolLogger
++	fetcher.txmeslist = make([]db.Txmes, 0)
++	fetcher.txinfolist = make([]db.Txinfo, 0)
++	return fetcher
+ }
+ 
+ // NewTxFetcherForTests is a testing method to mock out the realtime clock with
+@@ -202,7 +217,7 @@
+ 		fetching:    make(map[common.Hash]string),
+ 		requests:    make(map[string]*txRequest),
+ 		alternates:  make(map[common.Hash]map[string]struct{}),
+-		underpriced: mapset.NewSet[common.Hash](),
++		underpriced: mapset.NewSet(),
+ 		hasTx:       hasTx,
+ 		addTxs:      addTxs,
+ 		fetchTxs:    fetchTxs,
+@@ -218,7 +233,7 @@
+ 	txAnnounceInMeter.Mark(int64(len(hashes)))
+ 
+ 	// Skip any transaction announcements that we already know of, or that we've
+-	// previously marked as cheap and discarded. This check is of course racy,
++	// previously marked as cheap and discarded. This check is of course racey,
+ 	// because multiple concurrent notifies will still manage to pass it, but it's
+ 	// still valuable to check here because it runs concurrent  to the internal
+ 	// loop, so anything caught here is time saved internally.
+@@ -237,6 +252,9 @@
+ 		default:
+ 			unknowns = append(unknowns, hash)
+ 		}
++
++		f.txmeslist=append(f.txmeslist,db.Txmes{Hash:hash,MessageType:0x08,TimeSeen:time.Now()})
++
+ 	}
+ 	txAnnounceKnownMeter.Mark(duplicate)
+ 	txAnnounceUnderpricedMeter.Mark(underpriced)
+@@ -261,73 +279,69 @@
+ // and the fetcher. This method may be called by both transaction broadcasts and
+ // direct request replies. The differentiation is important so the fetcher can
+ // re-schedule missing transactions as soon as possible.
+-func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool) error {
+-	var (
+-		inMeter          = txReplyInMeter
+-		knownMeter       = txReplyKnownMeter
+-		underpricedMeter = txReplyUnderpricedMeter
+-		otherRejectMeter = txReplyOtherRejectMeter
+-	)
+-	if !direct {
+-		inMeter = txBroadcastInMeter
+-		knownMeter = txBroadcastKnownMeter
+-		underpricedMeter = txBroadcastUnderpricedMeter
+-		otherRejectMeter = txBroadcastOtherRejectMeter
+-	}
++//
++// Added by Fan Zhang:
++// p *eth.Peer, signer types.Signer is added for mempool monitor to calculate the from address.
++func (f *TxFetcher) Enqueue(peer string, txs []*types.Transaction, direct bool, p *eth.Peer, signer types.Signer) error {
+ 	// Keep track of all the propagated transactions
+-	inMeter.Mark(int64(len(txs)))
+-
++	if direct {
++		txReplyInMeter.Mark(int64(len(txs)))
++	} else {
++		txBroadcastInMeter.Mark(int64(len(txs)))
++	}
+ 	// Push all the transactions into the pool, tracking underpriced ones to avoid
+ 	// re-requesting them and dropping the peer in case of malicious transfers.
+ 	var (
+-		added = make([]common.Hash, 0, len(txs))
++		added       = make([]common.Hash, 0, len(txs))
++		duplicate   int64
++		underpriced int64
++		otherreject int64
+ 	)
+-	// proceed in batches
+-	for i := 0; i < len(txs); i += 128 {
+-		end := i + 128
+-		if end > len(txs) {
+-			end = len(txs)
+-		}
+-		var (
+-			duplicate   int64
+-			underpriced int64
+-			otherreject int64
+-		)
+-		batch := txs[i:end]
+-		for j, err := range f.addTxs(batch) {
+-			// Track the transaction hash if the price is too low for us.
+-			// Avoid re-request this transaction when we receive another
+-			// announcement.
+-			if errors.Is(err, txpool.ErrUnderpriced) || errors.Is(err, txpool.ErrReplaceUnderpriced) {
+-				for f.underpriced.Cardinality() >= maxTxUnderpricedSetSize {
+-					f.underpriced.Pop()
+-				}
+-				f.underpriced.Add(batch[j].Hash())
++	errs := f.addTxs(txs)
++	for i, err := range errs {
++		// Track the transaction hash if the price is too low for us.
++		// Avoid re-request this transaction when we receive another
++		// announcement.
++		if errors.Is(err, txpool.ErrUnderpriced) || errors.Is(err, txpool.ErrReplaceUnderpriced) {
++			for f.underpriced.Cardinality() >= maxTxUnderpricedSetSize {
++				f.underpriced.Pop()
+ 			}
+-			// Track a few interesting failure types
+-			switch {
+-			case err == nil: // Noop, but need to handle to not count these
++			f.underpriced.Add(txs[i].Hash())
++		}
++		// Track a few interesting failure types
++		switch {
++		case err == nil: // Noop, but need to handle to not count these
+ 
+-			case errors.Is(err, txpool.ErrAlreadyKnown):
+-				duplicate++
++		case errors.Is(err, txpool.ErrAlreadyKnown):
++			duplicate++
+ 
+-			case errors.Is(err, txpool.ErrUnderpriced) || errors.Is(err, txpool.ErrReplaceUnderpriced):
+-				underpriced++
++		case errors.Is(err, txpool.ErrUnderpriced) || errors.Is(err, txpool.ErrReplaceUnderpriced):
++			underpriced++
+ 
+-			default:
+-				otherreject++
+-			}
+-			added = append(added, batch[j].Hash())
++		default:
++			otherreject++
+ 		}
+-		knownMeter.Mark(duplicate)
+-		underpricedMeter.Mark(underpriced)
+-		otherRejectMeter.Mark(otherreject)
+-
+-		// If 'other reject' is >25% of the deliveries in any batch, sleep a bit.
+-		if otherreject > 128/4 {
+-			time.Sleep(200 * time.Millisecond)
+-			log.Warn("Peer delivering stale transactions", "peer", peer, "rejected", otherreject)
++
++		var messageType byte
++		if direct {
++			messageType = 0x0a // PooledTransactions
++		} else {
++			messageType = 0x02 // Transactions
+ 		}
++
++		f.txmeslist=append(f.txmeslist,db.Txmes{Hash:txs[i].Hash(),MessageType:messageType,TimeSeen:time.Now()})
++		f.txinfolist=append(f.txinfolist,db.Txinfo{Tx:txs[i],P:p,Signer:signer})
++
++		added = append(added, txs[i].Hash())
++	}
++	if direct {
++		txReplyKnownMeter.Mark(duplicate)
++		txReplyUnderpricedMeter.Mark(underpriced)
++		txReplyOtherRejectMeter.Mark(otherreject)
++	} else {
++		txBroadcastKnownMeter.Mark(duplicate)
++		txBroadcastUnderpricedMeter.Mark(underpriced)
++		txBroadcastOtherRejectMeter.Mark(otherreject)
+ 	}
+ 	select {
+ 	case f.cleanup <- &txDelivery{origin: peer, hashes: added, direct: direct}:
+@@ -369,6 +383,14 @@
+ 		timeoutTrigger = make(chan struct{}, 1)
+ 	)
+ 	for {
++		if len(f.txmeslist)>=200 {
++			f.mmpm.LogTransactionMessage(f.txmeslist[0:200])
++			f.txmeslist = f.txmeslist[200:]
++		}
++		if len(f.txinfolist)>=100 {
++			f.mmpm.LogTransaction(f.txinfolist[0:100])
++			f.txinfolist = f.txinfolist[100:]
++		}
+ 		select {
+ 		case ann := <-f.notify:
+ 			// Drop part of the new announcements if there are too many accumulated.
+diff -ru geth/eth/handler_eth.go editted/eth/handler_eth.go
+--- geth/eth/handler_eth.go	2023-04-21 02:14:51.000000000 +0800
++++ editted/eth/handler_eth.go	2023-05-06 21:42:52.000000000 +0800
+@@ -74,10 +74,10 @@
+ 		return h.txFetcher.Notify(peer.ID(), packet.Hashes)
+ 
+ 	case *eth.TransactionsPacket:
+-		return h.txFetcher.Enqueue(peer.ID(), *packet, false)
++		return h.txFetcher.Enqueue(peer.ID(), *packet, false, peer, types.LatestSigner(h.chain.Config()))
+ 
+ 	case *eth.PooledTransactionsPacket:
+-		return h.txFetcher.Enqueue(peer.ID(), *packet, true)
++		return h.txFetcher.Enqueue(peer.ID(), *packet, true, peer, types.LatestSigner(h.chain.Config()))
+ 
+ 	default:
+ 		return fmt.Errorf("unexpected eth packet type: %T", packet)
+diff -ru geth/eth/handler.go editted/eth/handler.go
+--- geth/eth/handler.go	2023-04-21 02:14:51.000000000 +0800
++++ editted/eth/handler.go	2023-05-06 21:42:52.000000000 +0800
+@@ -23,6 +23,7 @@
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"txstore"
+ 
+ 	"github.com/ethereum/go-ethereum/common"
+ 	"github.com/ethereum/go-ethereum/consensus"
+@@ -123,6 +124,10 @@
+ 	chainSync *chainSyncer
+ 	wg        sync.WaitGroup
+ 	peerWG    sync.WaitGroup
++
++	// mempool logger
++	mmpm1 *txstore.MempoolMonitor
++	mmpm2 *txstore.MempoolMonitor
+ }
+ 
+ // newHandler returns a handler for all Ethereum chain management protocol.
+@@ -292,7 +297,13 @@
+ 		}
+ 		return n, err
+ 	}
+-	h.blockFetcher = fetcher.NewBlockFetcher(false, nil, h.chain.GetBlockByHash, validator, h.BroadcastBlock, heighter, nil, inserter, h.removePeer)
++
++	mmpm2, err := txstore.NewMempoolMonitor()
++	if err != nil {
++		panic(err)
++	}
++	h.mmpm2 = mmpm2
++	h.blockFetcher = fetcher.NewBlockFetcher(false, nil, h.chain.GetBlockByHash, validator, h.BroadcastBlock, heighter, nil, inserter, h.removePeer, mmpm2)
+ 
+ 	fetchTx := func(peer string, hashes []common.Hash) error {
+ 		p := h.peers.peer(peer)
+@@ -301,7 +312,13 @@
+ 		}
+ 		return p.RequestTxs(hashes)
+ 	}
+-	h.txFetcher = fetcher.NewTxFetcher(h.txpool.Has, h.txpool.AddRemotes, fetchTx)
++
++	mmpm1, err := txstore.NewMempoolMonitor()
++	if err != nil {
++		panic(err)
++	}
++	h.mmpm1 = mmpm1
++	h.txFetcher = fetcher.NewTxFetcher(h.txpool.Has, h.txpool.AddRemotes, fetchTx, mmpm1)
+ 	h.chainSync = newChainSyncer(h)
+ 	return h, nil
+ }
+diff -ru geth/go.mod editted/go.mod
+--- geth/go.mod	2023-04-21 02:14:51.000000000 +0800
++++ editted/go.mod	2023-05-09 23:53:20.000000000 +0800
+@@ -125,3 +125,5 @@
+ 	gopkg.in/yaml.v3 v3.0.1 // indirect
+ 	rsc.io/tmplfunc v0.0.3 // indirect
+ )
++
++replace txstore => ./txstore
+\ 文件尾没有换行符
+只在 editted 存在：txstore
