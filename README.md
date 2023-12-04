@@ -1,6 +1,8 @@
 ## Go Ethereum Mempool
 
-Golang execution layer implementation of the Ethereum protocol with data collection.
+Here's the Golang execution layer implementation of the Ethereum protocol with data collection, geth-mempool.
+
+I built this project on the basis of [Geth](https://github.com/ethereum/go-ethereum), and modified this set-up instruction.
 
 ## Building the source
 
